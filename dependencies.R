@@ -1,0 +1,5 @@
+install.packages("rmarkdown")
+install.packages("dplyr")
+install.packages("dbplyr")
+install.packages("httpuv")
+install.packages("ggplot2")

@@ -1,0 +1,279 @@
+---
+title: "Investigating Air Quality with BigRQuery"
+author: "Kevin Ushey"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: html_notebook
+---
+
+# Getting Started with BigRQuery
+
+In this R Notebook, we'll use the `bigrquery` package to explore some of the public air quality datasets available on the Google Cloud Platform. These datasets are provided by the US [Environmental Protection Agency](https://www.epa.gov/) and the [OpenAQ](https://openaq.org/) community.
+
+## Loading bigrquery
+
+Note that the `bigrquery` package comes preinstalled on RStudio Server Pro instances launched on Google Cloud; however, if you are running this on a local R instance you can install the package from CRAN. We'll install a number of the packages used in this demo up-front.
+
+```{r}
+packages <- c("rmarkdown", "dplyr", "dbplyr", "httpuv", "ggplot2", "bigrquery")
+for (package in packages)
+  if (!length(find.package(package, quiet = TRUE)))
+    install.packages(package)
+```
+
+Now that we have these packages installed, let's load them into R up-front.
+
+```{r}
+library(bigrquery)
+library(dplyr)
+library(dbplyr)
+```
+
+
+## Credentials + Project Setup
+
+Normally, the `bigrquery` package will 'just work' -- when you attempt to access BigQuery, OAuth will be used for authentication, and the generated credentials will be cached on your machine. For the purposes of my demo, I wanted to skip the OAuth step here, so I have the credentials already cached on the system as per the directions in <https://developers.google.com/identity/protocols/application-default-credentials?hl=en_US> -- but you should be able to omit this step if you prefer.
+
+
+```{r}
+# set project name
+project <- "perfect-lantern-179621"
+
+# set up credentials
+credentials <- readr::read_file("credentials.json")
+set_service_token(credentials)
+```
+
+
+## First Steps
+
+First, let's try running some raw SQL with `query_exec()` to confirm that we've got our environment set up as expected. We'll try looking at the first 20 rows of the `air_quality_annual_summary` data set, from the `epa_historical_air_quality` database. (See <https://bigquery.cloud.google.com/dataset/bigquery-public-data:epa_historical_air_quality> for more details on this dataset.)
+
+```{r}
+# generate our SQL query (as an R string)
+sql <- "
+  SELECT
+    *
+  FROM 
+    [bigquery-public-data:epa_historical_air_quality.air_quality_annual_summary]
+  LIMIT
+    20
+"
+
+# run it with 'query_exec()'
+query_exec(sql, project = project)
+```
+
+`query_exec()` is handy when you want to execute a one-off query, or a set of SQL that you've either defined inline or perhaps as part of a separate script (e.g. a `.sql` file).
+
+
+## Using DBI
+
+The `bigrquery` package also provides a DBI driver, which makes it possible to talk to Google's BigQuery using the `DBI` generics you might already be familiar with.
+
+```{r}
+library(DBI)
+
+# construct a DBI connection using bigrquery's DBI driver to the
+# 'epa_historical_air_quality' database
+conn <- DBI::dbConnect(
+  bigrquery::dbi_driver(),
+  project = "bigquery-public-data",
+  dataset = "epa_historical_air_quality",
+  billing = project
+)
+
+# list the tables available in this database
+DBI::dbListTables(conn)
+```
+
+Great! Let's try running the same query we used above. Now that we've established a connection directly to the `epa_historical_air_quality` database, it's no longer necessary to specifiy the full `[database:table]` name in our SQL statement -- we can reference the `air_quality_annual_summary` table directly.
+
+```{r}
+# run a SQL statement directly
+sql <- "SELECT * FROM air_quality_annual_summary LIMIT 20"
+DBI::dbGetQuery(conn, sql)
+```
+
+In fact, once we have this DBI connection available, we can write a SQL code block directly to construct and execute a query.
+
+```{sql, connection="conn"}
+SELECT * FROM air_quality_annual_summary LIMIT 20
+```
+
+
+## Using dplyr
+
+The `dplyr` package provides a flexible grammar for data manipulation. It has three main goals:
+
+- Identify the most important data manipulation verbs and make them easy to use from R.
+
+- Provide blazing fast performance for in-memory data by writing key pieces in C++ (using Rcpp)
+
+- Use the same interface to work with data no matter where it's stored, whether in a data frame, a data table or database.
+
+This implies that the same code you might use to interact with an in-memory R data.frame will look very similar to the code you might write to access a table stored in a SQL database. Let's get `dplyr` talking to Google BigQuery:
+
+```{r}
+# construct a 'src': this is the connection object that dplyr uses
+# to communicate with Google BigQuery
+src <- bigrquery::src_bigquery(
+  project = "bigquery-public-data",
+  dataset = "epa_historical_air_quality",
+  billing = project
+)
+
+# generate a reference to the 'air_quality_annual_summary' table
+aqas <- tbl(src, "air_quality_annual_summary")
+
+head(aqas, n = 20)
+```
+
+Awesome! Now, let's try using `dplyr` to answer the question, "what was the average air quality in each year, by state?". In the context of SQL databases, you can think of `dplyr` as a generator for SQL select statements.
+
+```{r}
+# construct our query using the dplyr interface
+query <- aqas %>%
+  select(state_name, year, units_of_measure, arithmetic_mean) %>%
+  group_by(state_name, year) %>%
+  summarize(avg = mean(arithmetic_mean))
+
+# inspect the SQL actually generated here
+sql_render(query)
+```
+
+Now, let's try running that query:
+
+```{r}
+# use 'collect()' to execute the query, and retrieve
+# the results as an R data.frame
+quality <- collect(query)
+quality
+```
+
+
+## Interlude
+
+You might be a bit confused by the `%>%` operator above. This is a user-defined operator provided by the `magrittr` package (whose name is inspired by René Magritte's "Ceci n'est pas une pipe"). It's similar to the F# pipe-forward operator, and its main utility is unwrapping nested function calls and avoiding temporary variables. Compare:
+
+```{r}
+# without the pipe operator, you might write
+analyze(subset(prepare(dataset)))
+
+# with the pipe, you could unfold this as
+data %>% prepare() %>% subset() %>% analyze()
+```
+
+It helps to read the `%>%` operator as the "and then" operator in the context of `dplyr`. We can use it to great effect with the `dplyr` package.
+
+
+## Back on Track
+
+Awesome! Now, let's switch gears a bit. The annual summary dataset aggregates a lot of disparate air quality measures, which means normalizing the various data is a bit out of scope for this talk. Let's look at the `pm25_frm_daily_summary` dataset, which (roughly speaking) measures the density of particulate matter of 25 microns or less in the air. (A description of the table is available at <https://bigquery.cloud.google.com/table/bigquery-public-data:epa_historical_air_quality.pm25_frm_daily_summary>.)
+
+```{r}
+pm25 <- tbl(src, "pm25_frm_daily_summary")
+head(pm25, n = 20)
+```
+
+Let's look at the yearly average PM25.
+
+```{r}
+avg <- pm25 %>%
+  select(state_name, arithmetic_mean, date_local) %>%
+  mutate(year = extract(year %from% date_local)) %>%
+  group_by(state_name, year) %>%
+  summarize(mean = mean(arithmetic_mean)) %>%
+  arrange(state_name, year) %>%
+  collect()
+
+head(avg, n = 20)
+```
+
+And let's take a look at the trends over time. We'll use the `ggplot2` package to visualize.
+
+```{r}
+library(ggplot2)
+
+plot_average <- function(data) {
+  ggplot(data, aes(x = year, y = mean)) +
+    geom_line() +
+    facet_wrap(~ state_name) +
+    labs(x = "Year", y = expression(Average ~ PM[25] ~ Concentration)) +
+    ggtitle(expression(Average ~ Historical ~ PM[25] ~ Concentration)) +
+    theme(
+      axis.text.x = element_text(size = 6, angle = 45),
+      axis.text.y = element_text(size = 6)
+    ) 
+}
+
+plot_average(avg)
+```
+
+Looks like there was a big spike in California's pollution in the early 2000. Let's remove that data just to make the trend for other states more clear:
+
+```{r}
+avg %>%
+  filter(year > 2000) %>%
+  plot_average()
+```
+
+Cool! Let's do one last cool thing -- we'll use the `leaflet` package to visualize the last hour of Air Quality data, as provided by [OpenAQ](https://openaq.org/) and made available in the `global_air_quality` dataset.
+
+```{r}
+src <- bigrquery::src_bigquery(
+  project = "bigquery-public-data",
+  dataset = "openaq",
+  billing = project
+)
+
+tbl <- tbl(src, "global_air_quality")
+head(tbl, n = 20)
+```
+
+```{r}
+library(leaflet)
+
+# define our query and collect the data into R
+pm25 <- tbl %>%
+  filter(pollutant == "pm25", country == "US") %>%
+  select(location, city, country, value, latitude, longitude, timestamp) %>%
+  arrange(value) %>%
+  collect()
+
+# define a palette used for coloring points on our map
+# we'll color based on the measured pm10 (higher is darker orange)
+pal <- colorNumeric("Oranges", domain = pm25$value)
+
+# format used for labels
+fmt <- "[%s] %s, %s, %s: (%s)"
+
+# construct our map
+leaflet(pm25) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    lat = ~ latitude,
+    lng = ~ longitude,
+    color = ~ pal(value),
+    label = ~ sprintf(fmt, timestamp, location, city, country, value),
+    stroke = FALSE,
+    fillOpacity = 0.6
+  ) %>%
+  addLegend(
+    "bottomright",
+    pal = pal,
+    values = ~ value,
+    title = "Latest Measured PM25"
+  )
+```
+
+---
+
+Thanks for attending! If you'd like to learn more about RStudio, please visit us at <https://www.rstudio.com>.
+
+The materials for this demo are available at <https://github.com/kevinushey/2017-google-cloud-bigquery>.
+
+
+
+
+
+
